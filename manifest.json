@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.iampoul.omatime",
+  "name": "omaTime",
+  "version": "1.0.0",
+  "author": "iampoul",
+  "license": "MIT",
+  "description": "Time tracking in the bar: task sessions with notes and tags, break reminders, and a today graph.",
+  "kinds": ["service", "bar-widget", "overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "overlay": "BreakOverlay.qml"
+  },
+  "barWidget": {
+    "displayName": "omaTime",
+    "description": "Track time per task, stick notes/tags, and be reminded to take breaks",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "autoStopOnPanelClose": true
+    },
+    "schema": []
+  }
+}
