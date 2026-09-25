@@ -23,7 +23,16 @@
 set -euo pipefail
 
 DB="${OMATIME_DB:-$HOME/.local/share/omatime/omatime.db}"
-mkdir -p "$(dirname "$DB")"
+DB_DIR="$(dirname "$DB")"
+mkdir -p "$DB_DIR"
+# The database holds private task names and session notes: lock the directory
+# to the owner (0700) and the file to mode 0600, regardless of umask. Existing
+# files get normalized too, so a DB first created with a loose umask is fixed.
+chmod 700 "$DB_DIR"
+if [[ ! -e "$DB" ]]; then
+  : >"$DB"
+fi
+chmod 600 "$DB"
 
 init_db() {
   sqlite3 "$DB" <<'SQL'

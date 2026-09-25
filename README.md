@@ -67,8 +67,11 @@ omarchy plugin remove io.github.iampoul.omatime
 ## Data, privacy, and dependencies
 
 - Sessions, notes, tags, and break settings are stored in
-  `~/.local/share/omatime/omatime.db` (SQLite). Removing the plugin or its
-  manifest does not touch the data; delete the database to start fresh.
+  `~/.local/share/omatime/omatime.db` (SQLite). The database directory is
+  created mode `0700` and the file mode `0600` (owner-only), regardless of
+  umask, so other local users cannot read tracked task names or session notes.
+  Removing the plugin or its manifest does not touch the data; delete the
+  database to start fresh.
 - The backend (`omatime-db.sh`) requires `sqlite3` and `jq`. Notifications use
   `omarchy-notification-send`, which ships with Omarchy.
 - The plugin never overwrites Omarchy's `shell.json` or any user configuration.
