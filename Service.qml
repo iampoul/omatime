@@ -331,21 +331,77 @@ Item {
     Process {
         id: dbProc
         property var cb: null
-        stdout: StdioCollector { id: dbOut; waitForEnd: true }
-        stderr: StdioCollector { id: dbErr; waitForEnd: true }
+        // Hard bounds so a hung or verbose helper can never pin the shared
+        // shell or balloon memory: SIGKILL once either stream exceeds the
+        // byte budget, and again once the deadline elapses. Both are
+        // deliberately generous — a normal query finishes in milliseconds.
+        property int deadlineMs: 15000
+        property int byteBudget: 1048576
+        property bool killed: false
+
+        function killIfBounded() {
+            if (!dbProc.running) return
+            dbProc.killed = true
+            dbProc.signal(9) // SIGKILL; setting running=false would only SIGTERM
+        }
+
+        // Length of a collector's buffer regardless of how Quickshell exposes
+        // `data` (ArrayBuffer byteLength vs string length) in this version.
+        function bufLen(col) {
+            var d = col.data
+            if (!d) return 0
+            if (typeof d.byteLength === "number") return d.byteLength
+            if (typeof d.length === "number") return d.length
+            return 0
+        }
+
+        stdout: StdioCollector {
+            id: dbOut
+            waitForEnd: false
+            onDataChanged: {
+                if (dbProc.bufLen(dbOut) > dbProc.byteBudget)
+                    dbProc.killIfBounded()
+            }
+        }
+        stderr: StdioCollector {
+            id: dbErr
+            waitForEnd: false
+            onDataChanged: {
+                if (dbProc.bufLen(dbErr) > dbProc.byteBudget)
+                    dbProc.killIfBounded()
+            }
+        }
+        onRunningChanged: {
+            if (dbProc.running) {
+                dbProc.killed = false
+                dbTimeout.stop()
+                dbTimeout.start()
+            } else {
+                dbTimeout.stop()
+            }
+        }
         onExited: (exitCode) => {
+            dbTimeout.stop()
             var body = dbOut.text.trim()
             var parsed = null
             if (exitCode === 0 && body) {
                 try { parsed = JSON.parse(body) } catch (e) {}
             }
-            if (exitCode !== 0)
+            if (exitCode !== 0 || dbProc.killed)
                 console.log("omarchy-omatime: db error:", dbErr.text.trim() || dbOut.text.trim())
             if (dbProc.cb) dbProc.cb(parsed)
             dbProc.cb = null
             dbBusy = false
             pumpDb()
         }
+    }
+
+    // Process has no default property, so the deadline timer lives beside it;
+    // reference the process by id so it only fires while a query is running.
+    Timer {
+        id: dbTimeout
+        interval: dbProc.deadlineMs
+        onTriggered: dbProc.killIfBounded()
     }
 
     Process {

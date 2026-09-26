@@ -70,6 +70,10 @@ omarchy plugin remove io.github.iampoul.omatime
   `~/.local/share/omatime/omatime.db` (SQLite). The database directory is
   created mode `0700` and the file mode `0600` (owner-only), regardless of
   umask, so other local users cannot read tracked task names or session notes.
+  The path is pinned and owner-checked: an absolute path is required, every
+  component from the file up to `/` is tested and any symlink is refused (a
+  planted link cannot redirect the DB or point `chmod` at another file), and
+  both the directory and file must be owned by the effective uid.
   Removing the plugin or its manifest does not touch the data; delete the
   database to start fresh.
 - The backend (`omatime-db.sh`) requires `sqlite3` and `jq`. Notifications use

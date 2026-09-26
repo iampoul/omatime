@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.iampoul.omatime",
   "name": "omaTime",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "iampoul",
   "license": "MIT",
   "description": "Time tracking in the bar: task sessions with notes and tags, break reminders, and a today graph.",

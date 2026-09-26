@@ -22,16 +22,67 @@
 
 set -euo pipefail
 
+# --- private data path ------------------------------------------------------
+# The database holds private task names and session notes. We require:
+#   * an absolute path (never a peer-controlled relative path),
+#   * every path component checked as we walk down — any symlink is refused,
+#     so a planted link can't redirect the DB or point chmod at another file,
+#   * the file itself regular (no device/fifo/chardev) and, once created,
+#     mode 0600 owned by the effective uid,
+#   * the directory owned by the effective uid, mode 0700 regardless of umask.
+# This makes $OMATIME_DB a trusted, pinned, owner-checked location.
 DB="${OMATIME_DB:-$HOME/.local/share/omatime/omatime.db}"
 DB_DIR="$(dirname "$DB")"
+
+[[ "$DB" = /* ]] || { echo "refusing relative DB path: $DB" >&2; exit 1; }
+[[ "$DB_DIR" = /* ]] || { echo "refusing relative DB dir: $DB_DIR" >&2; exit 1; }
+
+# Walk dirname() chain from the file itself to /; refuse on the first symlink.
+no_symlinks() {
+  local cur="$1"
+  while true; do
+    if [[ -L "$cur" ]]; then
+      echo "refusing symlink in data path: $cur" >&2
+      exit 1
+    fi
+    [[ "$cur" == "/" ]] && break
+    cur="$(dirname "$cur")"
+  done
+}
+
+no_symlinks "$DB"
+
 mkdir -p "$DB_DIR"
-# The database holds private task names and session notes: lock the directory
-# to the owner (0700) and the file to mode 0600, regardless of umask. Existing
-# files get normalized too, so a DB first created with a loose umask is fixed.
-chmod 700 "$DB_DIR"
-if [[ ! -e "$DB" ]]; then
-  : >"$DB"
+no_symlinks "$DB_DIR"
+
+# Directory: must be owned by the effective uid and private to it.
+if [[ "$(stat -c %u "$DB_DIR")" != "$(id -u)" ]]; then
+  echo "refusing DB dir not owned by effective uid: $DB_DIR" >&2
+  exit 1
 fi
+chmod 700 "$DB_DIR"
+
+# File: if it pre-exists it must be a regular file (not a symlink or device),
+# owned by the effective uid, then normalized to 0600. Freshly created files
+# are created empty and set to 0600 immediately.
+if [[ -e "$DB" || -L "$DB" ]]; then
+  [[ -f "$DB" ]] || { echo "refusing non-regular DB file: $DB" >&2; exit 1; }
+  if [[ "$(stat -c %u "$DB")" != "$(id -u)" ]]; then
+    echo "refusing DB file not owned by effective uid: $DB" >&2
+    exit 1
+  fi
+  chmod 600 "$DB"
+else
+  : >"$DB"
+  chmod 600 "$DB"
+fi
+# Re-refuse after creation: if the final path is now a symlink, someone raced us.
+no_symlinks "$DB"
+
+# The umask may have been hostile when the path component above $DB_DIR was
+# created (e.g. $HOME/.local/share). Leave parents alone; the leaf dir+file are
+# what we control and they are now 0700/0600. Re-secure the leaf in every case.
+chmod 700 "$DB_DIR"
 chmod 600 "$DB"
 
 init_db() {
