@@ -87,7 +87,12 @@ fd_chmod() {
 no_symlinks "$DB_DIR"
 
 # Directory: create it if missing, refuse if it appeared as a symlink, require
-# ownership and chmod via an open fd (fixed fd 6).
+# ownership and chmod via an open fd (fixed fd 6). FD 6 STAYS OPEN for the
+# whole process: every SQLite open below addresses the DB through
+# /proc/self/fd/<fd>/omatime.db, so the kernel re-resolves the held directory
+# inode at open time — a textual swap of any parent component cannot redirect
+# the DB. The inode-identity check ensures fd 6 was opened on the path we
+# just walked and verified.
 if [[ ! -e "$DB_DIR" ]]; then
   mkdir -p "$DB_DIR"
 fi
@@ -97,16 +102,13 @@ di_n=$(ls -di "$DB_DIR" | awk '{print $1}')
 di_f=$(stat -Lc %i /proc/self/fd/6)
 if [[ "$di_n" != "$di_f" ]]; then
   echo "refusing raced DB dir (inode differs): $DB_DIR" >&2
-  exec 6<&-
   exit 1
 fi
 if [[ "$(stat -Lc %u /proc/self/fd/6)" != "$(id -u)" ]]; then
   echo "refusing DB dir not owned by effective uid: $DB_DIR" >&2
-  exec 6<&-
   exit 1
 fi
 chmod 700 /proc/self/fd/6
-exec 6<&-
 
 # Keep an already-correct DB (or normalize a pre-existing regular one) to
 # 0600. The file is created by SQLite on demand (umask 077 applies). Fresh
@@ -115,19 +117,11 @@ if [[ -e "$DB" || -L "$DB" ]]; then
   fd_chmod "$DB" 600
 fi
 
-# All SQLite opens go through the nofollow URI so the final component is
-# never followed even if swapped between our checks and the open. URI paths
-# must be percent-encoded (%; ?/#/space would otherwise select a
-# different file than intended).
-uri_encode() {
-  local s="$1"
-  s="${s//%/%25}"        # % first, never re-encoded below
-  s="${s//\?/%3F}"       # \? — an unescaped ? is a single-char glob
-  s="${s//\#/%23}"
-  s="${s// /%20}"
-  printf '%s' "$s"
-}
-DB_URI="file:$(uri_encode "$DB")?nofollow=1"
+# All SQLite opens go through the held directory fd via /proc/self/fd/6, so no
+# textual path component is ever re-walked, plus "nofollow=1" so the leaf is
+# atomically refused if it is a symlink at open time. OMIT: opening the file
+# itself through an fd would misplace sqlite's -journal/-wal companions.
+DB_URI="file:/proc/self/fd/6/$DB_NAME?nofollow=1"
 sql() { sqlite3 "$DB_URI" "$@"; }
 
 init_db() {
