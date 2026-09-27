@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # omatime-db.sh — sqlite3 backend for the omaTime plugin.
-# Data lives at $OMATIME_DB (default ~/.local/share/omatime/omatime.db).
+# Data lives in the pinned, owner-checked directory ~/.local/share/omatime
+# (never redirectable via environment). See the hardening notes below.
 #
 # Commands:
 #   init                        create schema
@@ -21,23 +22,28 @@
 #   set <key> <value>           upsert a global setting
 
 set -euo pipefail
+# Everything we create must be owner-only by default, regardless of umask.
+umask 077
 
-# --- private data path ------------------------------------------------------
-# The database holds private task names and session notes. We require:
-#   * an absolute path (never a peer-controlled relative path),
-#   * every path component checked as we walk down — any symlink is refused,
-#     so a planted link can't redirect the DB or point chmod at another file,
-#   * the file itself regular (no device/fifo/chardev) and, once created,
-#     mode 0600 owned by the effective uid,
-#   * the directory owned by the effective uid, mode 0700 regardless of umask.
-# This makes $OMATIME_DB a trusted, pinned, owner-checked location.
-DB="${OMATIME_DB:-$HOME/.local/share/omatime/omatime.db}"
-DB_DIR="$(dirname "$DB")"
+# --- pinned private data path ----------------------------------------------
+# The database holds private task names and session notes. Threat model: a
+# planted or swapped symlink / non-regular file must never redirect the DB or
+# point writes or chmods at another file. Defense:
+#   * the path is PINNED — built from $HOME only, no environment override;
+#   * every component from the leaf up to / is walked and any symlink refuses
+#     the run before anything is touched;
+#   * the directory is owner-checked and chmod'd through an open fd
+#     (/proc/self/fd), not by name, so a name swap cannot redirect the chmod;
+#   * SQLite opens the DB via URI "nofollow=1", which atomically refuses a
+#     symlink (or any non-regular file) at the final component at open time;
+#   * umask 077 makes every file/directory we create 0600/0700 by default.
+DB_DIR="$HOME/.local/share/omatime"
+DB_NAME="omatime.db"
+DB="$DB_DIR/$DB_NAME"
 
-[[ "$DB" = /* ]] || { echo "refusing relative DB path: $DB" >&2; exit 1; }
-[[ "$DB_DIR" = /* ]] || { echo "refusing relative DB dir: $DB_DIR" >&2; exit 1; }
+[[ "$DB" = /* ]] || { echo "refusing non-absolute DB path: $DB" >&2; exit 1; }
 
-# Walk dirname() chain from the file itself to /; refuse on the first symlink.
+# Walk dirname() chain from the given path up to /; refuse on the first symlink.
 no_symlinks() {
   local cur="$1"
   while true; do
@@ -50,43 +56,65 @@ no_symlinks() {
   done
 }
 
-no_symlinks "$DB"
-
-mkdir -p "$DB_DIR"
-no_symlinks "$DB_DIR"
-
-# Directory: must be owned by the effective uid and private to it.
-if [[ "$(stat -c %u "$DB_DIR")" != "$(id -u)" ]]; then
-  echo "refusing DB dir not owned by effective uid: $DB_DIR" >&2
-  exit 1
-fi
-chmod 700 "$DB_DIR"
-
-# File: if it pre-exists it must be a regular file (not a symlink or device),
-# owned by the effective uid, then normalized to 0600. Freshly created files
-# are created empty and set to 0600 immediately.
-if [[ -e "$DB" || -L "$DB" ]]; then
-  [[ -f "$DB" ]] || { echo "refusing non-regular DB file: $DB" >&2; exit 1; }
-  if [[ "$(stat -c %u "$DB")" != "$(id -u)" ]]; then
-    echo "refusing DB file not owned by effective uid: $DB" >&2
+# Refuse if FILE is a symlink or non-regular; open it read-write on fixed fd 7
+# (bash only leaks explicitly numbered fds 3-9 to children — the `{var}` form
+# is close-on-exec — and 8/9 may be reserved by the caller, so use 6/7 for the
+# file/directory), verify the open fd refers to the same inode as the name,
+# and chmod via /proc/self/fd/7 — chmod by pathname would follow a swapped
+# symlink.
+fd_chmod() {
+  local file="$1" mode="$2"
+  [[ -L "$file" ]] && { echo "refusing symlink DB file: $file" >&2; exit 1; }
+  [[ -f "$file" ]] || { echo "refusing non-regular DB file: $file" >&2; exit 1; }
+  exec 7<>"$file"
+  local name_i fd_i
+  name_i=$(ls -di "$file" | awk '{print $1}')     # inode of the name itself (no follow)
+  fd_i=$(stat -Lc %i /proc/self/fd/7)             # -L: deref the fd link to the file
+  if [[ "$name_i" != "$fd_i" ]]; then
+    echo "refusing raced DB file (inode differs): $file" >&2
+    exec 7>&-
     exit 1
   fi
-  chmod 600 "$DB"
-else
-  : >"$DB"
-  chmod 600 "$DB"
-fi
-# Re-refuse after creation: if the final path is now a symlink, someone raced us.
-no_symlinks "$DB"
+  if [[ "$(stat -Lc %u /proc/self/fd/7)" != "$(id -u)" ]]; then
+    echo "refusing DB file not owned by effective uid: $file" >&2
+    exec 7>&-
+    exit 1
+  fi
+  chmod "$mode" /proc/self/fd/7
+  exec 7>&-
+}
 
-# The umask may have been hostile when the path component above $DB_DIR was
-# created (e.g. $HOME/.local/share). Leave parents alone; the leaf dir+file are
-# what we control and they are now 0700/0600. Re-secure the leaf in every case.
-chmod 700 "$DB_DIR"
-chmod 600 "$DB"
+no_symlinks "$DB_DIR"
+
+# Directory: create it if missing, refuse if it appeared as a symlink, require
+# ownership and chmod via an open fd (fixed fd 6).
+if [[ ! -e "$DB_DIR" ]]; then
+  mkdir -p "$DB_DIR"
+fi
+no_symlinks "$DB_DIR"
+exec 6<"$DB_DIR"
+if [[ "$(stat -Lc %u /proc/self/fd/6)" != "$(id -u)" ]]; then
+  echo "refusing DB dir not owned by effective uid: $DB_DIR" >&2
+  exec 6<&-
+  exit 1
+fi
+chmod 700 /proc/self/fd/6
+exec 6<&-
+
+# Keep an already-correct DB (or normalize a pre-existing regular one) to
+# 0600. The file is created by SQLite on demand (umask 077 applies). Fresh
+# files need no chmod here — sqlite honors umask 077 on creation.
+if [[ -e "$DB" || -L "$DB" ]]; then
+  fd_chmod "$DB" 600
+fi
+
+# All SQLite opens go through the nofollow URI so the final component is
+# never followed even if swapped between our checks and the open.
+DB_URI="file:$DB?nofollow=1"
+sql() { sqlite3 "$DB_URI" "$@"; }
 
 init_db() {
-  sqlite3 "$DB" <<'SQL'
+  sql <<'SQL'
 CREATE TABLE IF NOT EXISTS sessions (
   id    INTEGER PRIMARY KEY AUTOINCREMENT,
   task  TEXT NOT NULL,
@@ -113,10 +141,10 @@ CREATE TABLE IF NOT EXISTS settings (
 SQL
   # schema migration: older DBs lack the pause columns
   local has_paused_sec has_paused_at
-  has_paused_sec=$(sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='paused_sec';")
-  if [[ "$has_paused_sec" == "0" ]]; then sqlite3 "$DB" "ALTER TABLE sessions ADD COLUMN paused_sec INTEGER NOT NULL DEFAULT 0;"; fi
-  has_paused_at=$(sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='paused_at';")
-  if [[ "$has_paused_at" == "0" ]]; then sqlite3 "$DB" "ALTER TABLE sessions ADD COLUMN paused_at INTEGER;"; fi
+  has_paused_sec=$(sql "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='paused_sec';")
+  if [[ "$has_paused_sec" == "0" ]]; then sql "ALTER TABLE sessions ADD COLUMN paused_sec INTEGER NOT NULL DEFAULT 0;"; fi
+  has_paused_at=$(sql "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='paused_at';")
+  if [[ "$has_paused_at" == "0" ]]; then sql "ALTER TABLE sessions ADD COLUMN paused_at INTEGER;"; fi
   return 0
 }
 
@@ -126,7 +154,7 @@ c() { local s="$1"; printf '%s' "${s//\'/\'\'}"; }
 
 upsert_tasks_and_tags() {
   local task="$1" tags="$2" ts="$3"
-  sqlite3 "$DB" "
+  sql "
     INSERT OR REPLACE INTO tasks (name,last_used) VALUES ('$(c "$task")',$ts);
     INSERT OR IGNORE INTO tags (name,last_used)
       SELECT value, $ts FROM json_each('$(c "$tags")');
@@ -137,7 +165,7 @@ upsert_tasks_and_tags() {
 current() {
   init_db
   local out
-  out=$(sqlite3 -json "$DB" \
+  out=$(sql -json \
     "SELECT id,task,note,tags,start,paused_sec,paused_at FROM sessions WHERE end IS NULL ORDER BY id DESC LIMIT 1;" \
     | jq -c 'if length > 0 then (.[0] | .paused_sec //= 0 | .) else null end')
   [[ -n $out ]] || out=null
@@ -147,7 +175,7 @@ current() {
 # Fold any active pause into paused_sec, then close the running session.
 close_running() {
   local ts="$1"
-  sqlite3 "$DB" "
+  sql "
     UPDATE sessions SET
       paused_sec = paused_sec + CASE WHEN paused_at IS NOT NULL THEN $ts - paused_at ELSE 0 END,
       paused_at  = NULL,
@@ -160,7 +188,7 @@ start() {
   local task="${1:-Untitled}" note="${2:-}" tags="${3:-[]}"
   local ts; ts=$(date +%s)
   close_running "$ts"
-  sqlite3 "$DB" "
+  sql "
     INSERT INTO sessions (task,note,tags,start)
     VALUES ('$(c "$task")','$(c "$note")','$(c "$tags")',$ts);"
   upsert_tasks_and_tags "$task" "$tags" "$ts"
@@ -177,14 +205,14 @@ stop() {
 pause() {
   init_db
   local ts; ts=$(date +%s)
-  sqlite3 "$DB" "UPDATE sessions SET paused_at = COALESCE(paused_at, $ts) WHERE end IS NULL AND paused_at IS NULL;"
+  sql "UPDATE sessions SET paused_at = COALESCE(paused_at, $ts) WHERE end IS NULL AND paused_at IS NULL;"
   current
 }
 
 resume() {
   init_db
   local ts; ts=$(date +%s)
-  sqlite3 "$DB" "
+  sql "
     UPDATE sessions SET
       paused_sec = paused_sec + ($ts - paused_at),
       paused_at  = NULL
@@ -194,15 +222,15 @@ resume() {
 
 note() {
   init_db
-  sqlite3 "$DB" "UPDATE sessions SET note='$(c "${1:-}")' WHERE end IS NULL;"
+  sql "UPDATE sessions SET note='$(c "${1:-}")' WHERE end IS NULL;"
   current
 }
 
 tags() {
   init_db
   local json="${1:-[]}" ts; ts=$(date +%s)
-  sqlite3 "$DB" "UPDATE sessions SET tags='$(c "$json")' WHERE end IS NULL;"
-  sqlite3 "$DB" "
+  sql "UPDATE sessions SET tags='$(c "$json")' WHERE end IS NULL;"
+  sql "
     INSERT OR IGNORE INTO tags (name,last_used)
       SELECT value, $ts FROM json_each('$(c "$json")');
     UPDATE tags SET last_used = MAX(last_used, $ts)
@@ -214,11 +242,11 @@ tasks() {
   init_db
   local q="${1:-}"
   if [[ -n $q ]]; then
-    sqlite3 -json "$DB" \
+    sql -json \
       "SELECT name FROM tasks WHERE name LIKE '%$(c "$q")%' ORDER BY last_used DESC LIMIT 15;" \
       | jq -c '[.[].name]'
   else
-    sqlite3 -json "$DB" \
+    sql -json \
       "SELECT name FROM tasks ORDER BY last_used DESC LIMIT 15;" \
       | jq -c '[.[].name]'
   fi
@@ -228,11 +256,11 @@ taglist() {
   init_db
   local q="${1:-}"
   if [[ -n $q ]]; then
-    sqlite3 -json "$DB" \
+    sql -json \
       "SELECT name FROM tags WHERE name LIKE '%$(c "$q")%' ORDER BY last_used DESC LIMIT 15;" \
       | jq -c '[.[].name]'
   else
-    sqlite3 -json "$DB" \
+    sql -json \
       "SELECT name FROM tags ORDER BY last_used DESC LIMIT 15;" \
       | jq -c '[.[].name]'
   fi
@@ -270,7 +298,7 @@ range() {
       title="TODAY"
       ;;
   esac
-  sqlite3 -json "$DB" "
+  sql -json "
     SELECT id,task,note,tags,start,
            CASE WHEN end IS NULL THEN 0 ELSE 1 END AS closed,
            CASE WHEN end IS NULL THEN $now_sec ELSE end END AS end,
@@ -300,7 +328,7 @@ range() {
 history() {
   init_db
   local n="${2:-20}"
-  sqlite3 -json "$DB" "
+  sql -json "
     SELECT id, task, note, tags, start, end, paused_sec,
            (CASE WHEN end IS NOT NULL THEN (end - start) - COALESCE(paused_sec, 0) ELSE 0 END) AS active
     FROM sessions WHERE end IS NOT NULL ORDER BY id DESC LIMIT $((n));" | jq -c .
@@ -310,7 +338,7 @@ get() {
   init_db
   local key="${1:-}" def="${2:-}" out
   [[ -n $key ]] || { echo "null"; return; }
-  out=$(sqlite3 "$DB" "SELECT value FROM settings WHERE key='$(c "$key")';")
+  out=$(sql "SELECT value FROM settings WHERE key='$(c "$key")';")
   if [[ -n $out ]]; then
     printf '%s\n' "$out" | jq -R .
   elif [[ -n $def ]]; then
@@ -324,7 +352,7 @@ set() {
   init_db
   local key="${1:-}" value="${2:-}"
   [[ -n $key ]] || return
-  sqlite3 "$DB" "INSERT INTO settings (key,value) VALUES ('$(c "$key")','$(c "$value")')
+  sql "INSERT INTO settings (key,value) VALUES ('$(c "$key")','$(c "$value")')
     ON CONFLICT(key) DO UPDATE SET value='$(c "$value")';"
   get "$key"
 }
