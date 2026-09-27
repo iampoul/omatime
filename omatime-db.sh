@@ -93,6 +93,13 @@ if [[ ! -e "$DB_DIR" ]]; then
 fi
 no_symlinks "$DB_DIR"
 exec 6<"$DB_DIR"
+di_n=$(ls -di "$DB_DIR" | awk '{print $1}')
+di_f=$(stat -Lc %i /proc/self/fd/6)
+if [[ "$di_n" != "$di_f" ]]; then
+  echo "refusing raced DB dir (inode differs): $DB_DIR" >&2
+  exec 6<&-
+  exit 1
+fi
 if [[ "$(stat -Lc %u /proc/self/fd/6)" != "$(id -u)" ]]; then
   echo "refusing DB dir not owned by effective uid: $DB_DIR" >&2
   exec 6<&-
@@ -109,8 +116,18 @@ if [[ -e "$DB" || -L "$DB" ]]; then
 fi
 
 # All SQLite opens go through the nofollow URI so the final component is
-# never followed even if swapped between our checks and the open.
-DB_URI="file:$DB?nofollow=1"
+# never followed even if swapped between our checks and the open. URI paths
+# must be percent-encoded (%; ?/#/space would otherwise select a
+# different file than intended).
+uri_encode() {
+  local s="$1"
+  s="${s//%/%25}"        # % first, never re-encoded below
+  s="${s//\?/%3F}"       # \? — an unescaped ? is a single-char glob
+  s="${s//\#/%23}"
+  s="${s// /%20}"
+  printf '%s' "$s"
+}
+DB_URI="file:$(uri_encode "$DB")?nofollow=1"
 sql() { sqlite3 "$DB_URI" "$@"; }
 
 init_db() {
